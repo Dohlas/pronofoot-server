@@ -10,89 +10,100 @@ app.use(express.static('public'));
 
 const PORT = process.env.PORT || 3000;
 
-// ─── ROUTE : Scrape Score365 ───────────────────────────────────────────────
+// ─── ROUTE : Scrape 365scores.com ─────────────────────────────────────────
 app.post('/api/scrape', async (req, res) => {
   const { url } = req.body;
 
-  if (!url || !url.includes('score365')) {
-    return res.status(400).json({ error: 'URL Score365 invalide' });
+  if (!url || (!url.includes('365scores') && !url.includes('score365'))) {
+    return res.status(400).json({ error: 'URL invalide. Utilise un lien de 365scores.com' });
   }
 
   try {
+    // 365scores.com utilise React/SPA - on essaie d'abord la page normale
     const { data: html } = await axios.get(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Referer': 'https://www.365scores.com/',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
       },
-      timeout: 15000
+      timeout: 20000
     });
 
     const $ = cheerio.load(html);
-    const matchData = {};
+    const matchData = { sourceUrl: url };
 
+    // ── Extraire les infos depuis l'URL (très fiable pour 365scores) ──
+    // Ex: /fr/football/match/bundesliga-25/hamburger-sv-rb-leipzig-...
+    const urlParts = url.split('/');
+    const matchSlug = urlParts[urlParts.length - 1] || urlParts[urlParts.length - 2] || '';
+    const leagueSlug = urlParts.find(p => p.includes('-')) || '';
+
+    // Extraire équipes depuis le slug de l'URL
+    if (matchSlug && matchSlug.includes('-vs-')) {
+      const parts = matchSlug.split('-vs-');
+      matchData.team1 = parts[0].replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+      matchData.team2 = parts[1]?.split('-')[0]?.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) || '';
+    }
+
+    // Extraire ligue depuis l'URL
+    const leagueMatch = url.match(/\/football\/match\/([^/]+)\//);
+    if (leagueMatch) {
+      matchData.league = leagueMatch[1].replace(/-\d+$/, '').replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+    }
+
+    // ── Scraping HTML classique ──
     // Équipes
-    matchData.team1 = $('.home-team .team-name, .participant-name:first, [class*="home"] [class*="name"]').first().text().trim();
-    matchData.team2 = $('.away-team .team-name, .participant-name:last, [class*="away"] [class*="name"]').last().text().trim();
+    const team1Html = $('[class*="competitor-name"]:first, [class*="team-name"]:first, [class*="home-team"]:first, h1').first().text().trim();
+    const team2Html = $('[class*="competitor-name"]:last, [class*="team-name"]:last, [class*="away-team"]:last').last().text().trim();
+    if (team1Html && !matchData.team1) matchData.team1 = team1Html;
+    if (team2Html && !matchData.team2) matchData.team2 = team2Html;
 
-    // Date et heure
-    matchData.date = $('.match-date, .game-time, [class*="date"], [class*="time"]').first().text().trim();
+    // Date
+    matchData.date = $('[class*="date"], [class*="time"], time').first().text().trim();
 
-    // Compétition / Ligue
-    matchData.league = $('.tournament-name, .league-name, [class*="tournament"], [class*="league"]').first().text().trim();
+    // Score
+    matchData.score = $('[class*="score"]').first().text().trim();
 
-    // Score actuel si match en cours
-    matchData.score = $('.score, .current-score, [class*="score"]').first().text().trim();
+    // ── Texte brut complet (le plus important pour l'IA) ──
+    $('script, style, nav, footer, [class*="ad"], [class*="banner"], [class*="cookie"]').remove();
+    const rawText = $('body').text().replace(/\s+/g, ' ').trim();
+    matchData.rawText = rawText.slice(0, 10000);
 
-    // Extraire tout le texte pertinent de la page pour l'IA
-    // Joueurs blessés / suspendus
-    const injuries = [];
-    $('[class*="injur"], [class*="miss"], [class*="doubt"], [class*="absent"]').each((i, el) => {
-      const text = $(el).text().trim();
-      if (text.length > 1 && text.length < 200) injuries.push(text);
-    });
-    matchData.injuries = [...new Set(injuries)].slice(0, 20);
+    // ── Extraction intelligente depuis le texte brut ──
+    const injuryKeywords = ['blessé', 'absent', 'suspendu', 'doute', 'indisponible', 'injured', 'suspended', 'doubt', 'miss'];
+    const lines = rawText.split(/[.|\n]/).map(l => l.trim()).filter(l => l.length > 5 && l.length < 300);
 
-    // Derniers matchs / forme
-    const recentMatches = [];
-    $('[class*="last-match"], [class*="recent"], [class*="form"], [class*="result"]').each((i, el) => {
-      const text = $(el).text().trim();
-      if (text.length > 3 && text.length < 300) recentMatches.push(text);
-    });
-    matchData.recentMatches = [...new Set(recentMatches)].slice(0, 20);
+    const injuries = lines.filter(l => injuryKeywords.some(k => l.toLowerCase().includes(k)));
+    matchData.injuries = [...new Set(injuries)].slice(0, 15);
 
-    // Statistiques H2H
-    const h2h = [];
-    $('[class*="h2h"], [class*="head-to-head"], [class*="versus"]').each((i, el) => {
-      const text = $(el).text().trim();
-      if (text.length > 3 && text.length < 300) h2h.push(text);
-    });
-    matchData.h2h = [...new Set(h2h)].slice(0, 15);
+    const formKeywords = ['victoire', 'défaite', 'nul', 'win', 'loss', 'draw', 'derniers matchs', 'forme'];
+    const recentMatches = lines.filter(l => formKeywords.some(k => l.toLowerCase().includes(k)));
+    matchData.recentMatches = [...new Set(recentMatches)].slice(0, 15);
 
-    // Statistiques générales
-    const stats = [];
-    $('[class*="stat"], [class*="standing"], [class*="ranking"]').each((i, el) => {
-      const text = $(el).text().trim();
-      if (text.length > 3 && text.length < 200) stats.push(text);
-    });
-    matchData.stats = [...new Set(stats)].slice(0, 20);
+    const h2hKeywords = ['confrontation', 'face à face', 'h2h', 'head to head', 'historique'];
+    const h2h = lines.filter(l => h2hKeywords.some(k => l.toLowerCase().includes(k)));
+    matchData.h2h = [...new Set(h2h)].slice(0, 10);
 
-    // Extraire le texte brut global (fallback pour ne rien rater)
-    // Supprimer scripts et styles
-    $('script, style, nav, footer, header, .ad, .ads, [class*="banner"]').remove();
-    const rawText = $('body').text().replace(/\s+/g, ' ').trim().slice(0, 8000);
-    matchData.rawText = rawText;
+    // Vérification
+    if (!matchData.team1 && rawText.length < 200) {
+      return res.status(404).json({ error: '365scores.com utilise JavaScript dynamique. Les données de base ont été extraites depuis l\'URL.' });
+    }
 
-    // Vérification minimale
-    if (!matchData.team1 && !matchData.team2 && rawText.length < 100) {
-      return res.status(404).json({ error: 'Impossible de lire la page Score365. Le site a peut-être changé sa structure.' });
+    // Si pas d'équipes depuis HTML mais URL slug disponible
+    if (!matchData.team1 && matchSlug) {
+      const slugParts = matchSlug.split('-');
+      matchData.team1 = slugParts.slice(0, 2).join(' ');
+      matchData.team2 = slugParts.slice(2, 4).join(' ');
     }
 
     res.json({ success: true, data: matchData });
 
   } catch (err) {
     console.error('Scrape error:', err.message);
-    res.status(500).json({ error: `Erreur lors de la récupération: ${err.message}` });
+    res.status(500).json({ error: `Erreur: ${err.message}` });
   }
 });
 
